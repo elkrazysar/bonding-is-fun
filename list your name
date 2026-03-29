@@ -1,0 +1,534 @@
+-- Dead Rails Bond Farm | MobileLinoriaLib
+-- Rail logic: POAMAJ LE ANADKAT | Bond aura: aadoxide
+-- Cowboy + Non-Cowboy modes | Auto-die on rail end
+
+local RepoURL = "https://raw.githubusercontent.com/LionTheGreatRealFrFr/MobileLinoriaLib/main/"
+local Library      = loadstring(game:HttpGet(RepoURL .. "Library.lua"))()
+local ThemeManager = loadstring(game:HttpGet(RepoURL .. "addons/ThemeManager.lua"))()
+local SaveManager  = loadstring(game:HttpGet(RepoURL .. "addons/SaveManager.lua"))()
+
+-- ══════════════════════════════
+-- Services
+-- ══════════════════════════════
+local Players           = cloneref(game:GetService("Players"))
+local RunService        = cloneref(game:GetService("RunService"))
+local ReplicatedStorage = cloneref(game:GetService("ReplicatedStorage"))
+local VirtualUser       = cloneref(game:GetService("VirtualUser"))
+
+local LP = Players.LocalPlayer
+
+-- ══════════════════════════════
+-- State
+-- ══════════════════════════════
+local FarmActive   = false
+local Mode         = "Cowboy"
+local BondsTotal   = 0
+local RunBonds     = 0
+local RunCount     = 0
+local StatusText   = "Idle"
+
+-- Delay values (wired to sliders)
+local MainWaitTime    = 2.00   -- seconds between each rail position step
+local CollectWaitTime = 0.10   -- seconds between each bond collect in cluster
+
+local RailThread = nil
+local AuraThread = nil
+local KillThread = nil
+
+-- ══════════════════════════════
+-- Anti-AFK
+-- ══════════════════════════════
+LP.Idled:Connect(function()
+    VirtualUser:Button2Down(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+    task.wait(0.1)
+    VirtualUser:Button2Up(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+end)
+
+-- ══════════════════════════════
+-- Cowboy class remote
+-- ══════════════════════════════
+local function TrySetCowboy()
+    for _, remote in ipairs(game:GetDescendants()) do
+        if remote:IsA("RemoteEvent") or remote:IsA("RemoteFunction") then
+            local n = remote.Name:lower()
+            if n:find("class") or n:find("select") or n:find("cowboy") or n:find("role") then
+                pcall(function()
+                    if remote:IsA("RemoteEvent") then
+                        remote:FireServer("Cowboy")
+                    else
+                        remote:InvokeServer("Cowboy")
+                    end
+                end)
+            end
+        end
+    end
+end
+
+-- ══════════════════════════════
+-- Stop threads
+-- ══════════════════════════════
+local function StopThreads()
+    if RailThread then pcall(task.cancel, RailThread) RailThread = nil end
+    if AuraThread then pcall(task.cancel, AuraThread) AuraThread = nil end
+    if KillThread then pcall(task.cancel, KillThread) KillThread = nil end
+end
+
+-- ══════════════════════════════
+-- Die + restart
+-- ══════════════════════════════
+local function DieAndRestart()
+    StatusText = "Dying - restarting..."
+    StopThreads()
+    pcall(function() LP.Character:BreakJoints() end)
+end
+
+-- ══════════════════════════════
+-- NonCowboy: Actionable remote loop
+-- ══════════════════════════════
+local function StartAura()
+    AuraThread = task.spawn(function()
+        local Remote = ReplicatedStorage
+            :WaitForChild("Shared")
+            :WaitForChild("Universe")
+            :WaitForChild("Network")
+            :WaitForChild("RemoteEvent")
+            :WaitForChild("Actionable")
+
+        while FarmActive do
+            for i = 1000, 1500 do
+                if not FarmActive then return end
+                pcall(function()
+                    Remote:FireServer(i)
+                    RunBonds   = RunBonds + 1
+                    BondsTotal = BondsTotal + 1
+                end)
+                task.wait(CollectWaitTime)  -- << Collect Wait Time slider
+            end
+            task.wait(MainWaitTime)         -- << Main Wait Time slider
+        end
+    end)
+end
+
+-- ══════════════════════════════
+-- Cowboy: CFrame touch collect
+-- ══════════════════════════════
+local BondNames = {"Bond", "bond", "CashBond", "Cash_Bond", "MoneyBag", "GoldBond"}
+local function FindBonds()
+    local found = {}
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        for _, name in ipairs(BondNames) do
+            if obj.Name:lower():find(name:lower()) then
+                local part = obj:IsA("Model") and (obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")) or obj
+                if part then
+                    table.insert(found, part)
+                    break
+                end
+            end
+        end
+    end
+    return found
+end
+
+local function StartCowboyAura(root)
+    AuraThread = task.spawn(function()
+        while FarmActive do
+            local bonds = FindBonds()
+            for _, part in ipairs(bonds) do
+                if not FarmActive then return end
+                local prev = root.CFrame
+                pcall(function()
+                    root.CFrame = part.CFrame
+                    task.wait(0.05)
+                    root.CFrame = prev
+                    RunBonds   = RunBonds + 1
+                    BondsTotal = BondsTotal + 1
+                end)
+                task.wait(CollectWaitTime)  -- << Collect Wait Time slider
+            end
+            task.wait(MainWaitTime)         -- << Main Wait Time slider
+        end
+    end)
+end
+
+-- ══════════════════════════════
+-- Rail traversal
+-- ══════════════════════════════
+local function RunRailSession(root)
+    local velo   = 1500
+    local tRails = {}
+
+    for _, obj in ipairs(workspace:WaitForChild("RailSegments"):GetDescendants()) do
+        if obj:IsA("BasePart") and obj.Name == "Guide" then
+            table.insert(tRails, obj)
+        end
+    end
+
+    local function pathway(pos)
+        local closest, dist = nil, math.huge
+        for _, rail in ipairs(tRails) do
+            local d = (rail.Position - pos).Magnitude
+            if d < dist then dist = d; closest = rail end
+        end
+        return closest
+    end
+
+    workspace.CurrentCamera.CameraType = Enum.CameraType.Scriptable
+
+    local currentRail = pathway(root.Position)
+    local currentPos  = currentRail and currentRail.Position or root.Position
+    local tVisited    = {}
+    local lastDir     = Vector3.new(0, 0, 1)
+
+    while FarmActive do
+        if currentRail then
+            tVisited[currentRail] = true
+            lastDir = currentRail.CFrame.LookVector.Unit
+        end
+
+        local targetPos = currentPos - lastDir * 20
+        local distance  = (targetPos - currentPos).Magnitude
+        local duration  = distance / velo
+        local start     = tick()
+
+        while tick() - start < duration do
+            if not FarmActive then return end
+            local t   = (tick() - start) / duration
+            local pos = currentPos:Lerp(targetPos, t)
+            root.CFrame = CFrame.new(pos)
+            workspace.CurrentCamera.CFrame = CFrame.new(pos + Vector3.new(0, 15, 0), pos)
+            RunService.RenderStepped:Wait()
+        end
+
+        currentPos = targetPos
+
+        -- Wait between positions (Main Wait Time)
+        task.wait(MainWaitTime)
+
+        local nextRail = nil
+        local bDot     = 0.5
+
+        for _, rail in ipairs(tRails) do
+            if not tVisited[rail] then
+                local toRail = (rail.Position - currentPos).Unit
+                local dot    = lastDir:Dot(toRail)
+                if dot > bDot and (rail.Position - currentPos).Magnitude < 50 then
+                    bDot     = dot
+                    nextRail = rail
+                end
+            end
+        end
+
+        -- End of track → die
+        if not nextRail then
+            StatusText = "End of rails — dying..."
+            task.wait(0.5)
+            DieAndRestart()
+            return
+        end
+
+        currentRail = nextRail
+    end
+end
+
+-- ══════════════════════════════
+-- Session runner
+-- ══════════════════════════════
+local function RunFarmSession()
+    local Char = LP.Character
+    if not Char then return end
+    local root = Char:WaitForChild("HumanoidRootPart", 5)
+    if not root then return end
+
+    RunBonds   = 0
+    RunCount   = RunCount + 1
+    StatusText = "Run #" .. RunCount .. " | " .. Mode
+
+    if Mode == "Cowboy" then
+        TrySetCowboy()
+        task.wait(1)
+        StartCowboyAura(root)
+    else
+        StartAura()
+    end
+
+    RailThread = task.spawn(function()
+        RunRailSession(root)
+    end)
+
+    KillThread = task.delay(45, function()
+        if FarmActive then
+            StatusText = "Safety kill — restarting..."
+            DieAndRestart()
+        end
+    end)
+end
+
+local function StartFarm()
+    FarmActive = true
+    BondsTotal = 0
+    RunCount   = 0
+
+    LP.CharacterAdded:Connect(function()
+        if not FarmActive then return end
+        StopThreads()
+        task.wait(2)
+        pcall(function() workspace.CurrentCamera.CameraType = Enum.CameraType.Custom end)
+        RunFarmSession()
+    end)
+
+    if LP.Character then RunFarmSession() end
+end
+
+local function StopFarm()
+    FarmActive = false
+    StopThreads()
+    StatusText = "Idle"
+    pcall(function() workspace.CurrentCamera.CameraType = Enum.CameraType.Custom end)
+end
+
+-- ══════════════════════════════
+-- UI
+-- ══════════════════════════════
+local Window = Library:CreateWindow({
+    Title        = "Bond Farm",
+    Center       = true,
+    AutoShow     = true,
+    TabPadding   = 8,
+    MenuFadeTime = 0.2,
+})
+
+Library:SetColorScheme({ SchemeColor = Color3.fromRGB(180, 30, 30) })
+
+local Tabs = {
+    Main     = Window:AddTab("Main"),
+    Features = Window:AddTab("Features"),
+    Settings = Window:AddTab("Settings"),
+}
+
+-- ── Main tab ──
+local MainBox = Tabs.Main:AddLeftGroupbox("Main")
+local InfoBox = Tabs.Main:AddRightGroupbox("Info")
+
+-- Premium label (matches screenshot)
+MainBox:AddLabel("Premium Bond Farm")
+MainBox:AddLabel("only for server boosters and content creators\nif you want early access join the ringta\ndiscord server and make a video on the\nscript or boost the server\nONLY WORKING AUTO BOND SCRIPT RN")
+
+MainBox:AddDivider()
+
+-- Mode dropdown
+MainBox:AddDropdown("ModeDropdown", {
+    Text    = "Farm Mode",
+    Values  = { "Cowboy", "NonCowboy" },
+    Default = "Cowboy",
+    Tooltip = "Cowboy = CFrame touch bypass | NonCowboy = Actionable remote loop",
+    Callback = function(val)
+        Mode = val
+    end
+})
+
+MainBox:AddDivider()
+
+-- Start Bond Farm toggle (matches screenshot label exactly)
+MainBox:AddToggle("FarmToggle", {
+    Text     = "Start Bond Farm",
+    Default  = false,
+    Tooltip  = "Auto Farm Bonds.",
+    Callback = function(val)
+        if val then StartFarm() else StopFarm() end
+    end
+})
+
+MainBox:AddDivider()
+
+-- Bond Farm: Main Wait Time (matches screenshot)
+MainBox:AddSlider("MainWait", {
+    Text    = "Bond Farm: Main Wait Time",
+    Default = 2.00,
+    Min     = 0.10,
+    Max     = 10.0,
+    Rounding = 2,
+    Suffix  = "s",
+    Tooltip = "Delay (seconds) between each bond position.",
+    Callback = function(val)
+        MainWaitTime = val
+        Library:Notify("WaitTime set to " .. val .. "s", 2)
+    end
+})
+
+-- Bond Farm: Collect Wait Time (matches screenshot)
+MainBox:AddSlider("CollectWait", {
+    Text    = "Bond Farm: Collect Wait Time",
+    Default = 0.10,
+    Min     = 0.01,
+    Max     = 2.0,
+    Rounding = 2,
+    Suffix  = "s",
+    Tooltip = "Delay between collecting each bond in cluster (lower=faster).",
+    Callback = function(val)
+        CollectWaitTime = val
+    end
+})
+
+-- Info labels
+local StatusLbl = InfoBox:AddLabel("Status: Idle")
+local TotalLbl  = InfoBox:AddLabel("0 bonds collected (0 this run)")
+local RunCntLbl = InfoBox:AddLabel("Runs: 0")
+
+InfoBox:AddDivider()
+InfoBox:AddButton({
+    Text = "Reset Counter",
+    Func = function()
+        BondsTotal = 0; RunBonds = 0; RunCount = 0
+    end
+})
+
+task.spawn(function()
+    while true do
+        task.wait(0.4)
+        pcall(function()
+            StatusLbl:SetText("Status: " .. StatusText)
+            TotalLbl:SetText(BondsTotal .. " bonds collected (" .. RunBonds .. " this run)")
+            RunCntLbl:SetText("Runs: " .. RunCount)
+        end)
+    end
+end)
+
+-- ── Features tab ──
+local FeatBox = Tabs.Features:AddLeftGroupbox("Extra")
+FeatBox:AddToggle("AutoCowboyRespawn", {
+    Text    = "Re-fire Cowboy on Respawn",
+    Default = true,
+    Tooltip = "Re-fires cowboy class remote every respawn (Cowboy mode only)",
+    Callback = function(val)
+        if val then
+            LP.CharacterAdded:Connect(function()
+                if Mode == "Cowboy" and FarmActive then
+                    task.wait(1.5)
+                    TrySetCowboy()
+                end
+            end)
+        end
+    end
+})
+
+FeatBox:AddButton({
+    Text = "Set Cowboy Class Now",
+    Func = function()
+        TrySetCowboy()
+        Library:Notify("Cowboy class fired!", 3)
+    end
+})
+
+-- ── Settings ──
+local SettBox = Tabs.Settings:AddLeftGroupbox("Settings")
+ThemeManager:SetLibrary(Library)
+SaveManager:SetLibrary(Library)
+SaveManager:SetFolder("DeadRailsBondFarm")
+SaveManager:BuildConfigSection(SettBox)
+ThemeManager:ApplyToTab(Tabs.Settings)
+SaveManager:LoadAutoloadConfig()
+
+-- ══════════════════════════════
+-- Mobile HUD
+-- ══════════════════════════════
+local hudGui = Instance.new("ScreenGui")
+hudGui.Name = "BondFarmHUD"
+hudGui.ResetOnSpawn = false
+hudGui.IgnoreGuiInset = true
+hudGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+hudGui.Parent = gethui and gethui() or LP.PlayerGui
+
+-- Bond counter overlay
+local countFrame = Instance.new("Frame")
+countFrame.Size = UDim2.new(0, 280, 0, 36)
+countFrame.Position = UDim2.new(0.5, -140, 0, 8)
+countFrame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+countFrame.BackgroundTransparency = 0.4
+countFrame.Parent = hudGui
+Instance.new("UICorner", countFrame).CornerRadius = UDim.new(0, 8)
+
+local countLbl = Instance.new("TextLabel")
+countLbl.Size = UDim2.new(1, 0, 1, 0)
+countLbl.BackgroundTransparency = 1
+countLbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+countLbl.Font = Enum.Font.GothamBold
+countLbl.TextSize = 14
+countLbl.Text = "0 bonds collected (0 this run)"
+countLbl.Parent = countFrame
+
+task.spawn(function()
+    while true do
+        task.wait(0.4)
+        pcall(function()
+            countLbl.Text = BondsTotal .. " bonds collected (" .. RunBonds .. " this run)"
+        end)
+    end
+end)
+
+-- FARM button
+local function MakeHudBtn(lbl, px, py)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, 75, 0, 75)
+    btn.Position = UDim2.new(px, 0, py, 0)
+    btn.AnchorPoint = Vector2.new(0.5, 0.5)
+    btn.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    btn.BackgroundTransparency = 0.3
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 14
+    btn.Text = lbl
+    btn.Parent = hudGui
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(1, 0)
+    local s = Instance.new("UIStroke", btn)
+    s.Color = Color3.fromRGB(255,255,255)
+    s.Thickness = 1.5
+
+    local dragging, dragDelta, dragStart, startPos = false, 0, nil, nil
+    btn.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.Touch or inp.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true; dragDelta = 0
+            dragStart = inp.Position; startPos = btn.Position
+        end
+    end)
+    btn.InputChanged:Connect(function(inp)
+        if dragging and (inp.UserInputType == Enum.UserInputType.Touch or inp.UserInputType == Enum.UserInputType.MouseMove) then
+            local d = inp.Position - dragStart
+            dragDelta = d.Magnitude
+            btn.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+    btn.InputEnded:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.Touch or inp.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = false
+        end
+    end)
+    return btn, function() return dragDelta end
+end
+
+local farmBtn, farmDelta = MakeHudBtn("FARM\nOFF", 0.88, 0.88)
+farmBtn.InputEnded:Connect(function(inp)
+    if inp.UserInputType == Enum.UserInputType.Touch or inp.UserInputType == Enum.UserInputType.MouseButton1 then
+        if farmDelta() < 8 then
+            local toggle = Options and Options["FarmToggle"]
+            if toggle then
+                toggle:SetValue(not FarmActive)
+            else
+                if FarmActive then StopFarm() else StartFarm() end
+            end
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.3)
+        pcall(function()
+            farmBtn.Text = FarmActive and "FARM\nON" or "FARM\nOFF"
+            farmBtn.BackgroundColor3 = FarmActive
+                and Color3.fromRGB(20, 100, 20)
+                or  Color3.fromRGB(30, 30, 30)
+        end)
+    end
+end)
+
+Library:Notify("Dead Rails Bond Farm loaded!", 4)
